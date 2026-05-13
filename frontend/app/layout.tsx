@@ -42,8 +42,7 @@ function ParticleField() {
             ctx.beginPath()
             ctx.strokeStyle = `rgba(139,92,246,${0.05 * (1 - d / 90)})`
             ctx.lineWidth = 0.5
-            ctx.moveTo(p.x, p.y)
-            ctx.lineTo(q.x, q.y)
+            ctx.moveTo(p.x, p.y); ctx.lineTo(q.x, q.y)
             ctx.stroke()
           }
         })
@@ -76,9 +75,9 @@ function NavTabs({ currentPath }: { currentPath: string }) {
         <Link
           key={tab.id}
           href={tab.href}
-          className={`nav-tab flex flex-col sm:flex-row items-center justify-center gap-1 sm:gap-[6px] flex-1 sm:flex-none !px-1 sm:!px-[18px] !py-2 sm:!py-[7px] ${isActive(tab) ? "active" : ""}`}
+          className={`nav-tab flex flex-col sm:flex-row items-center justify-center gap-0.5 sm:gap-[6px] ${isActive(tab) ? "active" : ""}`}
         >
-          <span>{tab.icon}</span>
+          <span style={{ fontSize: 16 }}>{tab.icon}</span>
           <span>{tab.label}</span>
         </Link>
       ))}
@@ -95,55 +94,54 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <meta name="description" content="Upload past papers. AI predicts your next exam questions." />
         <link rel="manifest" href="/manifest.json" />
         <meta name="theme-color" content="#8b5cf6" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
       </head>
       <body>
         <ThemeProvider attribute="class" defaultTheme="dark" enableSystem={false}>
           <ParticleField />
 
-          {/* HEADER — theme-aware */}
           <header style={{
-            position: "sticky",
-            top: 0,
-            zIndex: 100,
+            position: "sticky", top: 0, zIndex: 100,
             borderBottom: "1px solid var(--border-color)",
             background: "var(--header-bg)",
             backdropFilter: "blur(20px)",
             height: 60,
           }}>
-            <div className="max-w-6xl mx-auto flex items-center justify-between h-full px-6">
-              <Link href="/" className="flex items-center gap-2 no-underline">
-                <span className="text-[20px] font-extrabold tracking-[-0.5px] gradient-text">
-                  ExamPredictor
-                </span>
-                <span style={{
-                  display: "inline-block", width: 6, height: 6, borderRadius: "50%",
-                  background: "var(--violet)", animation: "livePulse 2s infinite",
-                }} />
+            <div className="max-w-6xl mx-auto flex items-center justify-between h-full px-4 sm:px-6">
+              <Link href="/" className="flex items-center gap-2 no-underline flex-shrink-0">
+                <span className="text-[20px] font-extrabold tracking-[-0.5px] gradient-text">ExamPredictor</span>
+                <span style={{ display: "inline-block", width: 6, height: 6, borderRadius: "50%", background: "var(--violet)", animation: "livePulse 2s infinite" }} />
               </Link>
+              {/* Desktop nav */}
               <div className="hidden sm:flex items-center gap-3">
                 <NavTabs currentPath={pathname} />
                 <ThemeToggle />
                 <span className="badge-live">AI LIVE</span>
               </div>
-              <div className="flex items-center gap-3 sm:hidden">
+              {/* Mobile: only toggle + badge */}
+              <div className="flex items-center gap-2 sm:hidden">
                 <ThemeToggle />
                 <span className="badge-live">AI LIVE</span>
               </div>
             </div>
           </header>
 
-          <div className="sm:hidden flex w-full px-4 py-3">
+          {/* Mobile bottom nav — full width with margin */}
+          <div className="sm:hidden w-full px-3 py-2">
             <NavTabs currentPath={pathname} />
           </div>
 
-          <main className="relative z-10 max-w-6xl mx-auto px-4 sm:px-6 py-8 pb-20">
+          {/* Page content with animation */}
+          <main
+            key={pathname}
+            className="page-animate relative z-10 max-w-6xl mx-auto px-4 sm:px-6 py-6 pb-20"
+          >
             {children}
           </main>
 
-          <footer style={{ borderTop: "1px solid var(--border-color)", padding: "32px 24px", background: "var(--surface)", position: "relative", zIndex: 10 }}>
+          <footer style={{ borderTop: "1px solid var(--border-color)", padding: "28px 24px", background: "var(--surface)", position: "relative", zIndex: 10 }}>
             <div className="max-w-6xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-4" style={{ fontSize: 13, color: "var(--text-muted)" }}>
-              <div>
-                Developed by{" "}
+              <div>Developed by{" "}
                 <a href="https://linkedin.com/in/RahatAhmedX" target="_blank" rel="noopener noreferrer"
                   style={{ color: "var(--violet-light)", textDecoration: "underline dotted", textUnderlineOffset: 2 }}>
                   Rahat

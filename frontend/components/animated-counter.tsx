@@ -1,23 +1,30 @@
 "use client"
 import { useState, useEffect } from "react"
 
-export function AnimatedCounter({ value, duration = 1400 }: { value: number; duration?: number }) {
+export function AnimatedCounter({ value, duration = 1200 }: { value: number; duration?: number }) {
   const [count, setCount] = useState(0)
 
   useEffect(() => {
-    let startTime: number | null = null
-    let raf: number
+    if (value === 0) return
+    let current = 0
+    const totalSteps = 40
+    const stepValue = Math.max(1, Math.ceil(value / totalSteps))
+    const intervalTime = Math.floor(duration / totalSteps)
+
+    // Small delay before starting
     const timeout = setTimeout(() => {
-      const step = (ts: number) => {
-        if (!startTime) startTime = ts
-        const progress = Math.min((ts - startTime) / duration, 1)
-        const ease = 1 - Math.pow(1 - progress, 3)
-        setCount(Math.floor(ease * value))
-        if (progress < 1) raf = requestAnimationFrame(step)
-      }
-      raf = requestAnimationFrame(step)
-    }, 300)
-    return () => { clearTimeout(timeout); if (raf) cancelAnimationFrame(raf) }
+      const interval = setInterval(() => {
+        current += stepValue
+        if (current >= value) {
+          current = value
+          clearInterval(interval)
+        }
+        setCount(current)
+      }, intervalTime)
+      return () => clearInterval(interval)
+    }, 200)
+
+    return () => clearTimeout(timeout)
   }, [value, duration])
 
   return <span>{count.toLocaleString()}</span>

@@ -17,7 +17,7 @@ export default function UploadQuestions() {
   const inputRef = useRef<HTMLInputElement>(null)
   const progressRef = useRef<NodeJS.Timeout | null>(null)
 
-  const years = Array.from({ length: new Date().getFullYear() - 1989 }, (_, i) => 2024 - i)
+  const years = Array.from({ length: new Date().getFullYear() - 1990 + 1 }, (_, i) => 1990 + i).reverse()
 
   useEffect(() => {
     if (loading) {

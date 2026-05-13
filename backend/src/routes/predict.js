@@ -7,117 +7,110 @@ const { downloadFileFromDrive } = require('../services/drive');
 const { sendLog, updateLog, registerCancelCallback } = require('../services/telegram');
 const router = express.Router();
 
-// SSE clients map: jobId -> res
 const sseClients = new Map();
-
-// In-memory job cancel flags
 const cancelledJobs = new Set();
 
 function sendSSE(jobId, data) {
   const client = sseClients.get(jobId);
   if (client) {
-    client.write(`data: ${JSON.stringify(data)}\n\n`);
+    try { client.write(`data: ${JSON.stringify(data)}\n\n`); } catch (e) {}
   }
 }
 
-// POST /api/predict/start
 router.post('/start', async (req, res) => {
   const { subject, targetYear } = req.body;
   const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.ip;
-
   if (!subject || !targetYear) return res.status(400).json({ error: 'Missing fields' });
 
   const jobId = uuidv4().slice(0, 8).toUpperCase();
-
   await sql`
     INSERT INTO prediction_jobs (id, subject, target_year, status, ip)
     VALUES (${jobId}, ${subject}, ${parseInt(targetYear)}, 'pending', ${ip})
   `;
 
-  // Start background processing (don't await)
   processJob(jobId, subject, parseInt(targetYear), ip).catch(async (err) => {
-    await sql`UPDATE prediction_jobs SET status = 'failed' WHERE id = ${jobId}`;
+    console.error('Job failed:', err);
+    await sql`UPDATE prediction_jobs SET status='failed', cancel_reason=${err.message} WHERE id=${jobId}`;
     sendSSE(jobId, { type: 'error', message: err.message });
+    // Detailed Telegram logging
+    void sendLog(
+      `❌ Job #${jobId} FAILED\n📘 Subject: ${subject}\n🗓️ Year: ${targetYear}\n🌐 IP: ${ip}\n\nError: ${err.message}\n\nStack:\n${(err.stack || '').slice(0, 2000)}`,
+      'error'
+    );
   });
 
   res.json({ jobId });
 });
 
-// GET /api/predict/progress/:jobId  (SSE stream)
 router.get('/progress/:jobId', async (req, res) => {
   const { jobId } = req.params;
-
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('Access-Control-Allow-Origin', process.env.FRONTEND_URL || '*');
   res.flushHeaders();
-
   sseClients.set(jobId, res);
 
-  // If job already done, send result immediately
-  const jobs = await sql`SELECT * FROM prediction_jobs WHERE id = ${jobId}`;
-  if (jobs.length > 0) {
-    const job = jobs[0];
-    if (job.status === 'completed') {
-      sendSSE(jobId, { type: 'complete', predictions: job.result.predictions });
-      res.end();
-      sseClients.delete(jobId);
-      return;
+  try {
+    const jobs = await sql`SELECT * FROM prediction_jobs WHERE id = ${jobId}`;
+    if (jobs.length > 0) {
+      const job = jobs[0];
+      if (job.status === 'completed') {
+        sendSSE(jobId, { type: 'complete', predictions: job.result.predictions });
+        res.end(); sseClients.delete(jobId); return;
+      }
+      if (job.status === 'cancelled') {
+        sendSSE(jobId, { type: 'cancelled', reason: job.cancel_reason });
+        res.end(); sseClients.delete(jobId); return;
+      }
+      if (job.status === 'failed') {
+        sendSSE(jobId, { type: 'error', message: job.cancel_reason || 'Job failed' });
+        res.end(); sseClients.delete(jobId); return;
+      }
     }
-    if (job.status === 'cancelled') {
-      sendSSE(jobId, { type: 'cancelled', reason: job.cancel_reason });
-      res.end();
-      sseClients.delete(jobId);
-      return;
-    }
-    if (job.status === 'failed') {
-      sendSSE(jobId, { type: 'error', message: 'Job failed' });
-      res.end();
-      sseClients.delete(jobId);
-      return;
-    }
-  }
+  } catch (e) {}
 
-  req.on('close', () => {
-    sseClients.delete(jobId);
-  });
+  req.on('close', () => sseClients.delete(jobId));
 });
 
-// GET /api/predict/status/:jobId (polling fallback)
 router.get('/status/:jobId', async (req, res) => {
-  const jobs = await sql`SELECT * FROM prediction_jobs WHERE id = ${req.params.jobId}`;
-  if (!jobs.length) return res.status(404).json({ error: 'Job not found' });
-  const job = jobs[0];
-  res.json({
-    status: job.status,
-    stage: job.progress_stage,
-    current: job.progress_current,
-    total: job.progress_total,
-    message: job.progress_message,
-    result: job.status === 'completed' ? job.result : null,
-    cancelReason: job.cancel_reason,
-  });
+  try {
+    const jobs = await sql`SELECT * FROM prediction_jobs WHERE id = ${req.params.jobId}`;
+    if (!jobs.length) return res.status(404).json({ error: 'Job not found' });
+    const job = jobs[0];
+    res.json({
+      status: job.status,
+      stage: job.progress_stage,
+      current: job.progress_current,
+      total: job.progress_total,
+      message: job.progress_message,
+      result: job.status === 'completed' ? job.result : null,
+      cancelReason: job.cancel_reason,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 async function processJob(jobId, subject, targetYear, ip) {
-  function isCancelled() {
-    return cancelledJobs.has(jobId);
-  }
+  function isCancelled() { return cancelledJobs.has(jobId); }
 
-  function progress(stage, current, total, message) {
+  async function progress(stage, current, total, message) {
     const eta = estimateETA(stage, current, total);
     const data = { type: 'progress', stage, current, total, message, eta };
     sendSSE(jobId, data);
-    void updateLog(jobId, `📊 Job #${jobId}\n📘 Subject: ${subject}\n🗓️ Year: ${targetYear}\n⏳ Stage: ${message}\n📈 Progress: ${current}/${total}${eta ? `\n⏱️ ETA: ~${eta}s` : ''}`, 'progress');
-    return sql`
+    void updateLog(jobId,
+      `📊 Job #${jobId}\n📘 ${subject} → ${targetYear}\n⏳ ${message}\n📈 ${current}/${total}${eta ? `\n⏱️ ETA: ~${eta}s` : ''}`,
+      'progress'
+    );
+    await sql`
       UPDATE prediction_jobs
-      SET progress_stage=${stage}, progress_current=${current}, progress_total=${total}, progress_message=${message}, updated_at=NOW()
+      SET progress_stage=${stage}, progress_current=${current}, progress_total=${total},
+          progress_message=${message}, updated_at=NOW()
       WHERE id=${jobId}
     `;
   }
 
-  // Register Telegram cancel callback
   registerCancelCallback(jobId, async (jId, feedback) => {
     cancelledJobs.add(jId);
     const reason = feedback || 'Cancelled by admin';
@@ -126,12 +119,15 @@ async function processJob(jobId, subject, targetYear, ip) {
     void sendLog(`❌ Job #${jId} cancelled\nReason: ${reason}`, 'warning');
   });
 
-  await sendLog(`🚀 Prediction started\n📘 Subject: ${subject}\n🗓️ Target: ${targetYear}\n🆔 Job: #${jobId}\n🌐 IP: ${ip}`, 'info', jobId);
+  await sendLog(
+    `🚀 Prediction started\n📘 Subject: ${subject}\n🗓️ Target: ${targetYear}\n🆔 Job: #${jobId}\n🌐 IP: ${ip}`,
+    'info', jobId
+  );
   await sql`UPDATE prediction_jobs SET status='processing' WHERE id=${jobId}`;
 
-  // Fetch questions
+  // FIX: explicit column names to avoid ambiguous "id"
   const questions = await sql`
-    SELECT id, year, text, drive_file_id, mime_type, ocr_done, ocr_failed
+    SELECT q.id, q.year, q.text, q.drive_file_id, q.mime_type, q.ocr_done, q.ocr_failed
     FROM questions q
     JOIN subjects s ON q.subject_id = s.id
     WHERE s.name = ${subject} AND q.year < ${targetYear}
@@ -142,33 +138,34 @@ async function processJob(jobId, subject, targetYear, ip) {
   const needOCR = questions.filter(q => !q.ocr_done && !q.ocr_failed && q.drive_file_id);
   await progress('ocr', 0, needOCR.length, `Starting OCR for ${needOCR.length} files...`);
 
-  // Parallel OCR (max 4 at a time)
-  const chunk = (arr, size) => Array.from({ length: Math.ceil(arr.length / size) }, (_, i) => arr.slice(i * size, i * size + size));
+  const chunk = (arr, size) =>
+    Array.from({ length: Math.ceil(arr.length / size) }, (_, i) => arr.slice(i * size, i * size + size));
   let ocrDone = 0;
 
   for (const batch of chunk(needOCR, 4)) {
     if (isCancelled()) return;
-
     await Promise.all(batch.map(async (q) => {
       try {
         const buf = await downloadFileFromDrive(q.drive_file_id);
         const text = await performOCR(buf, q.mime_type);
         await sql`UPDATE questions SET text=${text}, ocr_done=true WHERE id=${q.id}`;
         q.text = text;
+        void sendLog(`🔤 OCR done: Q#${q.id} Year ${q.year}`, 'info');
       } catch (e) {
         await sql`UPDATE questions SET ocr_failed=true WHERE id=${q.id}`;
+        void sendLog(`⚠️ OCR failed: Q#${q.id}\nError: ${e.message}`, 'warning');
       }
       ocrDone++;
       await progress('ocr', ocrDone, needOCR.length, `OCR: ${ocrDone}/${needOCR.length} files processed`);
     }));
   }
 
-  // Fetch resources
+  // FIX: explicit column names for resources too
   const resources = await sql`
-    SELECT id, text, drive_file_id, mime_type, ocr_done, type
-    FROM resources
-    WHERE (subject_name = ${subject} OR subject_name IS NULL)
-    AND NOT ocr_done
+    SELECT r.id, r.text, r.drive_file_id, r.mime_type, r.ocr_done, r.type
+    FROM resources r
+    WHERE (r.subject_name = ${subject} OR r.subject_name IS NULL)
+    AND NOT r.ocr_done
     LIMIT 10
   `;
 
@@ -183,7 +180,9 @@ async function processJob(jobId, subject, targetYear, ip) {
           const text = await performOCR(buf, r.mime_type);
           await sql`UPDATE resources SET text=${text.slice(0, 10000)}, ocr_done=true WHERE id=${r.id}`;
           r.text = text;
-        } catch (e) { /* skip */ }
+        } catch (e) {
+          void sendLog(`⚠️ Resource OCR failed: R#${r.id}\nError: ${e.message}`, 'warning');
+        }
         resDone++;
         await progress('ocr_resources', resDone, resources.length, `Resources: ${resDone}/${resources.length} processed`);
       }));
@@ -194,29 +193,32 @@ async function processJob(jobId, subject, targetYear, ip) {
 
   await progress('ai', 0, 1, 'AI analyzing patterns and generating predictions...');
 
-  // Re-fetch updated questions
   const allQuestions = await sql`
     SELECT q.year, q.text FROM questions q
     JOIN subjects s ON q.subject_id = s.id
     WHERE s.name = ${subject} AND q.year < ${targetYear} AND q.text != ''
-    ORDER BY q.year DESC LIMIT 50
+    ORDER BY q.year DESC LIMIT 40
   `;
 
   const allResources = await sql`
-    SELECT text FROM resources
-    WHERE (subject_name = ${subject} OR subject_name IS NULL) AND text != ''
+    SELECT r.text FROM resources r
+    WHERE (r.subject_name = ${subject} OR r.subject_name IS NULL) AND r.text != ''
     LIMIT 5
   `;
 
   const questionsList = allQuestions
-    .map(r => `Year ${r.year}: ${r.text.slice(0, 800)}`)
+    .map(r => `Year ${r.year}: ${r.text.slice(0, 500)}`)
     .join('\n\n');
 
   const resourcesText = allResources
-    .map(r => r.text.slice(0, 2000))
+    .map(r => r.text.slice(0, 1500))
     .join('\n\n');
 
-  const prompt = `You are an expert exam question predictor for Bangladesh education system.
+  void sendLog(`🧠 Sending to AI\n📘 ${subject} ${targetYear}\nQuestions: ${allQuestions.length}\nResources: ${allResources.length}`, 'info');
+
+  const result = await getPrediction([
+    { role: 'system', content: 'You output only valid JSON.' },
+    { role: 'user', content: `You are an expert exam question predictor for Bangladesh education system.
 Analyze previous years' questions for "${subject}" and predict the most likely questions for ${targetYear}.
 
 Output ONLY a JSON object: { "predictions": [ { "question_text": string, "probability": number (0-100), "explanation": string, "historical_years": number[], "similar_questions": string[] } ] }
@@ -225,14 +227,10 @@ Previous Questions:
 ${questionsList || 'None uploaded yet'}
 
 Study Resources:
-${resourcesText || 'None'}`;
-
-  const result = await getPrediction([
-    { role: 'system', content: 'You output only valid JSON.' },
-    { role: 'user', content: prompt },
+${resourcesText || 'None'}` },
   ]);
 
-  if (!result?.predictions?.length) throw new Error('AI returned invalid response');
+  if (!result?.predictions?.length) throw new Error('AI returned invalid or empty predictions');
 
   await sql`
     UPDATE prediction_jobs
@@ -241,7 +239,7 @@ ${resourcesText || 'None'}`;
   `;
 
   sendSSE(jobId, { type: 'complete', predictions: result.predictions });
-  void sendLog(`✅ Job #${jobId} complete\n📘 ${subject} ${targetYear}\n🔮 ${result.predictions.length} predictions`, 'success');
+  void sendLog(`✅ Job #${jobId} complete\n📘 ${subject} ${targetYear}\n🔮 ${result.predictions.length} predictions generated`, 'success');
   cancelledJobs.delete(jobId);
 }
 

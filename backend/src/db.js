@@ -7,12 +7,34 @@ let initialized = false;
 
 async function initDB() {
   if (initialized) return;
+
+  // Users table
+  await sql`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      email TEXT UNIQUE NOT NULL,
+      name TEXT,
+      avatar_url TEXT,
+      provider TEXT DEFAULT 'email',
+      provider_id TEXT,
+      password_hash TEXT,
+      email_verified BOOLEAN DEFAULT FALSE,
+      verification_token TEXT,
+      verification_expires TIMESTAMPTZ,
+      reset_token TEXT,
+      reset_expires TIMESTAMPTZ,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `;
+
   await sql`
     CREATE TABLE IF NOT EXISTS subjects (
       id SERIAL PRIMARY KEY,
       name TEXT UNIQUE NOT NULL
     )
   `;
+
   await sql`
     CREATE TABLE IF NOT EXISTS questions (
       id SERIAL PRIMARY KEY,
@@ -27,6 +49,7 @@ async function initDB() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     )
   `;
+
   await sql`
     CREATE TABLE IF NOT EXISTS resources (
       id SERIAL PRIMARY KEY,
@@ -38,9 +61,12 @@ async function initDB() {
       mime_type TEXT DEFAULT 'application/pdf',
       type TEXT DEFAULT 'image',
       ocr_done BOOLEAN DEFAULT FALSE,
+      total_pages INTEGER DEFAULT 0,
+      pages_processed INTEGER DEFAULT 0,
       created_at TIMESTAMPTZ DEFAULT NOW()
     )
   `;
+
   await sql`
     CREATE TABLE IF NOT EXISTS prediction_jobs (
       id TEXT PRIMARY KEY,
@@ -54,10 +80,17 @@ async function initDB() {
       result JSONB,
       cancel_reason TEXT,
       ip TEXT,
+      user_id INTEGER REFERENCES users(id),
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
     )
   `;
+
+  // Indexes for performance
+  await sql`CREATE INDEX IF NOT EXISTS idx_questions_subject_year ON questions(subject_id, year)`;
+  await sql`CREATE INDEX IF NOT EXISTS idx_prediction_jobs_status ON prediction_jobs(status)`;
+  await sql`CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)`;
+
   initialized = true;
   console.log('DB initialized');
 }

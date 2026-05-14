@@ -8,7 +8,7 @@ async function sendVerificationEmail(email, name, token) {
   const url = `${BACKEND_URL}/auth/verify-email?token=${token}`;
   try {
     await resend.emails.send({
-      from: `${APP_NAME} <onboarding@resend.dev>`,
+      from: `${APP_NAME} <verify@anorr.com>`,
       to: email,
       subject: `Verify your ${APP_NAME} account`,
       html: `
@@ -32,7 +32,7 @@ async function sendPasswordResetEmail(email, name, token) {
   const url = `${FRONTEND_URL}/reset-password?token=${token}`;
   try {
     await resend.emails.send({
-      from: `${APP_NAME} <onboarding@resend.dev>`,
+      from: `${APP_NAME} <reset@anorr.com>`,
       to: email,
       subject: `Reset your ${APP_NAME} password`,
       html: `

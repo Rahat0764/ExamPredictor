@@ -1,5 +1,6 @@
 "use client"
 import { useRef, useEffect } from "react"
+import { AuthButton } from "@/components/auth-button"
 import { usePathname } from "next/navigation"
 import { Toaster } from "sonner"
 import { ThemeProvider } from "@/components/theme-provider"
@@ -115,13 +116,15 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
               {/* Desktop nav */}
               <div className="hidden sm:flex items-center gap-3">
                 <NavTabs currentPath={pathname} />
+                <AuthButton />
                 <ThemeToggle />
                 <span className="badge-live">AI LIVE</span>
               </div>
               {/* Mobile: only toggle + badge */}
               <div className="flex items-center gap-2 sm:hidden">
+                <AuthButton /> 
                 <ThemeToggle />
-                <span className="badge-live">AI LIVE</span>
+                <span className="badge-live" style={{ display: "none" }}>AI LIVE</span>
               </div>
             </div>
           </header>

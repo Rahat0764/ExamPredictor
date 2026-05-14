@@ -4,7 +4,7 @@ const { sql } = require('../db');
 const { performOCR } = require('../services/ocr');
 const { getPrediction } = require('../services/groq');
 const { downloadFileFromDrive } = require('../services/drive');
-const { sendLog, updateLog, registerCancelCallback } = require('../services/telegram');
+const { sendLog, updateLog, registerCancelCallback, unregisterCancelCallback } = require('../services/telegram');
 const router = express.Router();
 
 const sseClients = new Map();
@@ -12,29 +12,42 @@ const cancelledJobs = new Set();
 
 function sendSSE(jobId, data) {
   const client = sseClients.get(jobId);
-  if (client) {
+  if (client && !client.writableEnded) {
     try { client.write(`data: ${JSON.stringify(data)}\n\n`); } catch (e) {}
+  }
+}
+
+function cleanupJob(jobId) {
+  cancelledJobs.delete(jobId);
+  unregisterCancelCallback(jobId);
+  const client = sseClients.get(jobId);
+  if (client) {
+    try { if (!client.writableEnded) client.end(); } catch (e) {}
+    sseClients.delete(jobId);
   }
 }
 
 router.post('/start', async (req, res) => {
   const { subject, targetYear } = req.body;
-  const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.ip;
+  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
   if (!subject || !targetYear) return res.status(400).json({ error: 'Missing fields' });
+  if (typeof subject !== 'string' || subject.length > 100) return res.status(400).json({ error: 'Invalid subject' });
 
   const jobId = uuidv4().slice(0, 8).toUpperCase();
   await sql`
     INSERT INTO prediction_jobs (id, subject, target_year, status, ip)
-    VALUES (${jobId}, ${subject}, ${parseInt(targetYear)}, 'pending', ${ip})
+    VALUES (${jobId}, ${subject.trim()}, ${parseInt(targetYear)}, 'pending', ${ip})
   `;
 
-  processJob(jobId, subject, parseInt(targetYear), ip).catch(async (err) => {
+  processJob(jobId, subject.trim(), parseInt(targetYear), ip).catch(async (err) => {
     console.error('Job failed:', err);
-    await sql`UPDATE prediction_jobs SET status='failed', cancel_reason=${err.message} WHERE id=${jobId}`;
+    try {
+      await sql`UPDATE prediction_jobs SET status='failed', cancel_reason=${err.message} WHERE id=${jobId}`;
+    } catch (e) {}
     sendSSE(jobId, { type: 'error', message: err.message });
-    // Detailed Telegram logging
+    cleanupJob(jobId);
     void sendLog(
-      `❌ Job #${jobId} FAILED\n📘 Subject: ${subject}\n🗓️ Year: ${targetYear}\n🌐 IP: ${ip}\n\nError: ${err.message}\n\nStack:\n${(err.stack || '').slice(0, 2000)}`,
+      `❌ Job #${jobId} FAILED\n📘 ${subject}\n🗓️ ${targetYear}\n🌐 ${ip}\n\nError: ${err.message}\n\nStack:\n${(err.stack || '').slice(0, 1500)}`,
       'error'
     );
   });
@@ -47,9 +60,26 @@ router.get('/progress/:jobId', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
   res.setHeader('Access-Control-Allow-Origin', process.env.FRONTEND_URL || '*');
   res.flushHeaders();
+
   sseClients.set(jobId, res);
+
+  // Heartbeat to keep connection alive
+  const heartbeat = setInterval(() => {
+    if (res.writableEnded) { clearInterval(heartbeat); return; }
+    try { res.write(': heartbeat\n\n'); } catch (e) { clearInterval(heartbeat); }
+  }, 25000);
+
+  const cleanup = () => {
+    clearInterval(heartbeat);
+    sseClients.delete(jobId);
+  };
+
+  req.on('close', cleanup);
+  req.on('error', cleanup);
+  res.on('error', cleanup);
 
   try {
     const jobs = await sql`SELECT * FROM prediction_jobs WHERE id = ${jobId}`;
@@ -57,20 +87,18 @@ router.get('/progress/:jobId', async (req, res) => {
       const job = jobs[0];
       if (job.status === 'completed') {
         sendSSE(jobId, { type: 'complete', predictions: job.result.predictions });
-        res.end(); sseClients.delete(jobId); return;
+        cleanup(); res.end(); return;
       }
       if (job.status === 'cancelled') {
         sendSSE(jobId, { type: 'cancelled', reason: job.cancel_reason });
-        res.end(); sseClients.delete(jobId); return;
+        cleanup(); res.end(); return;
       }
       if (job.status === 'failed') {
         sendSSE(jobId, { type: 'error', message: job.cancel_reason || 'Job failed' });
-        res.end(); sseClients.delete(jobId); return;
+        cleanup(); res.end(); return;
       }
     }
   } catch (e) {}
-
-  req.on('close', () => sseClients.delete(jobId));
 });
 
 router.get('/status/:jobId', async (req, res) => {
@@ -96,36 +124,42 @@ async function processJob(jobId, subject, targetYear, ip) {
   function isCancelled() { return cancelledJobs.has(jobId); }
 
   async function progress(stage, current, total, message) {
+    if (isCancelled()) return;
     const eta = estimateETA(stage, current, total);
-    const data = { type: 'progress', stage, current, total, message, eta };
-    sendSSE(jobId, data);
+    sendSSE(jobId, { type: 'progress', stage, current, total, message, eta });
     void updateLog(jobId,
-      `📊 Job #${jobId}\n📘 ${subject} → ${targetYear}\n⏳ ${message}\n📈 ${current}/${total}${eta ? `\n⏱️ ETA: ~${eta}s` : ''}`,
+      `📊 #${jobId}\n📘 ${subject} → ${targetYear}\n⏳ ${message}\n📈 ${current}/${total}${eta ? `\n⏱️ ~${eta}s` : ''}`,
       'progress'
     );
-    await sql`
-      UPDATE prediction_jobs
-      SET progress_stage=${stage}, progress_current=${current}, progress_total=${total},
-          progress_message=${message}, updated_at=NOW()
-      WHERE id=${jobId}
-    `;
+    try {
+      await sql`
+        UPDATE prediction_jobs
+        SET progress_stage=${stage}, progress_current=${current}, progress_total=${total},
+            progress_message=${message}, updated_at=NOW()
+        WHERE id=${jobId}
+      `;
+    } catch (e) {}
   }
 
+  // FIX: Cancel callback with cleanup
   registerCancelCallback(jobId, async (jId, feedback) => {
     cancelledJobs.add(jId);
     const reason = feedback || 'Cancelled by admin';
-    await sql`UPDATE prediction_jobs SET status='cancelled', cancel_reason=${reason} WHERE id=${jId}`;
+    try {
+      await sql`UPDATE prediction_jobs SET status='cancelled', cancel_reason=${reason} WHERE id=${jId}`;
+    } catch (e) {}
     sendSSE(jId, { type: 'cancelled', reason });
     void sendLog(`❌ Job #${jId} cancelled\nReason: ${reason}`, 'warning');
+    // Clean up after short delay
+    setTimeout(() => cleanupJob(jId), 2000);
   });
 
   await sendLog(
-    `🚀 Prediction started\n📘 Subject: ${subject}\n🗓️ Target: ${targetYear}\n🆔 Job: #${jobId}\n🌐 IP: ${ip}`,
+    `🚀 Prediction started\n📘 ${subject}\n🗓️ ${targetYear}\n🆔 #${jobId}\n🌐 ${ip}`,
     'info', jobId
   );
   await sql`UPDATE prediction_jobs SET status='processing' WHERE id=${jobId}`;
 
-  // FIX: explicit column names to avoid ambiguous "id"
   const questions = await sql`
     SELECT q.id, q.year, q.text, q.drive_file_id, q.mime_type, q.ocr_done, q.ocr_failed
     FROM questions q
@@ -136,13 +170,14 @@ async function processJob(jobId, subject, targetYear, ip) {
   `;
 
   const needOCR = questions.filter(q => !q.ocr_done && !q.ocr_failed && q.drive_file_id);
-  await progress('ocr', 0, needOCR.length, `Starting OCR for ${needOCR.length} files...`);
+  await progress('ocr', 0, needOCR.length, `Starting OCR for ${needOCR.length} question files...`);
 
   const chunk = (arr, size) =>
     Array.from({ length: Math.ceil(arr.length / size) }, (_, i) => arr.slice(i * size, i * size + size));
   let ocrDone = 0;
 
-  for (const batch of chunk(needOCR, 4)) {
+  // Process 2 at a time (rate limit friendly)
+  for (const batch of chunk(needOCR, 2)) {
     if (isCancelled()) return;
     await Promise.all(batch.map(async (q) => {
       try {
@@ -150,42 +185,50 @@ async function processJob(jobId, subject, targetYear, ip) {
         const text = await performOCR(buf, q.mime_type);
         await sql`UPDATE questions SET text=${text}, ocr_done=true WHERE id=${q.id}`;
         q.text = text;
-        void sendLog(`🔤 OCR done: Q#${q.id} Year ${q.year}`, 'info');
+        void sendLog(`🔤 OCR ✓ Q#${q.id} Year ${q.year} (${text.length} chars)`, 'info');
       } catch (e) {
         await sql`UPDATE questions SET ocr_failed=true WHERE id=${q.id}`;
-        void sendLog(`⚠️ OCR failed: Q#${q.id}\nError: ${e.message}`, 'warning');
+        void sendLog(`⚠️ OCR ✗ Q#${q.id}: ${e.message}`, 'warning');
       }
       ocrDone++;
-      await progress('ocr', ocrDone, needOCR.length, `OCR: ${ocrDone}/${needOCR.length} files processed`);
+      await progress('ocr', ocrDone, needOCR.length, `Questions OCR: ${ocrDone}/${needOCR.length} done`);
     }));
   }
 
-  // FIX: explicit column names for resources too
+  if (isCancelled()) return;
+
   const resources = await sql`
-    SELECT r.id, r.text, r.drive_file_id, r.mime_type, r.ocr_done, r.type
+    SELECT r.id, r.text, r.drive_file_id, r.mime_type, r.ocr_done, r.type, r.total_pages, r.pages_processed
     FROM resources r
-    WHERE (r.subject_name = ${subject} OR r.subject_name IS NULL)
-    AND NOT r.ocr_done
-    LIMIT 10
+    WHERE r.subject_name = ${subject} AND NOT r.ocr_done
+    LIMIT 5
   `;
 
   if (resources.length > 0) {
-    await progress('ocr_resources', 0, resources.length, 'Processing study resources...');
+    await progress('ocr_resources', 0, resources.length, 'Processing study resources (PDF optimization active)...');
     let resDone = 0;
-    for (const batch of chunk(resources, 2)) {
+    for (const r of resources) {
       if (isCancelled()) return;
-      await Promise.all(batch.map(async (r) => {
-        try {
-          const buf = await downloadFileFromDrive(r.drive_file_id);
-          const text = await performOCR(buf, r.mime_type);
-          await sql`UPDATE resources SET text=${text.slice(0, 10000)}, ocr_done=true WHERE id=${r.id}`;
-          r.text = text;
-        } catch (e) {
-          void sendLog(`⚠️ Resource OCR failed: R#${r.id}\nError: ${e.message}`, 'warning');
-        }
-        resDone++;
-        await progress('ocr_resources', resDone, resources.length, `Resources: ${resDone}/${resources.length} processed`);
-      }));
+      try {
+        const buf = await downloadFileFromDrive(r.drive_file_id);
+        const text = await performOCR(buf, r.mime_type, async (pagesProcessed, totalPages) => {
+          await progress(
+            'ocr_resources',
+            resDone,
+            resources.length,
+            `Resource ${resDone + 1}/${resources.length}: page ${pagesProcessed}/${totalPages}`
+          );
+          try {
+            await sql`UPDATE resources SET pages_processed=${pagesProcessed}, total_pages=${totalPages} WHERE id=${r.id}`;
+          } catch (e) {}
+        });
+        await sql`UPDATE resources SET text=${text.slice(0, 15000)}, ocr_done=true WHERE id=${r.id}`;
+        void sendLog(`📚 Resource OCR ✓ R#${r.id} (${text.length} chars)`, 'info');
+      } catch (e) {
+        void sendLog(`⚠️ Resource OCR ✗ R#${r.id}: ${e.message}`, 'warning');
+      }
+      resDone++;
+      await progress('ocr_resources', resDone, resources.length, `Resources: ${resDone}/${resources.length} processed`);
     }
   }
 
@@ -202,8 +245,8 @@ async function processJob(jobId, subject, targetYear, ip) {
 
   const allResources = await sql`
     SELECT r.text FROM resources r
-    WHERE (r.subject_name = ${subject} OR r.subject_name IS NULL) AND r.text != ''
-    LIMIT 5
+    WHERE r.subject_name = ${subject} AND r.text != ''
+    LIMIT 3
   `;
 
   const questionsList = allQuestions
@@ -214,19 +257,26 @@ async function processJob(jobId, subject, targetYear, ip) {
     .map(r => r.text.slice(0, 1500))
     .join('\n\n');
 
-  void sendLog(`🧠 Sending to AI\n📘 ${subject} ${targetYear}\nQuestions: ${allQuestions.length}\nResources: ${allResources.length}`, 'info');
+  void sendLog(`🧠 Sending to AI\n📘 ${subject} ${targetYear}\nQ: ${allQuestions.length} Resources: ${allResources.length}`, 'info');
 
   const result = await getPrediction([
-    { role: 'system', content: 'You output only valid JSON.' },
+    { role: 'system', content: 'You output only valid JSON. Always return at least 5 predictions.' },
     { role: 'user', content: `You are an expert exam question predictor for Bangladesh education system.
 Analyze previous years' questions for "${subject}" and predict the most likely questions for ${targetYear}.
 
-Output ONLY a JSON object: { "predictions": [ { "question_text": string, "probability": number (0-100), "explanation": string, "historical_years": number[], "similar_questions": string[] } ] }
+Output ONLY a JSON object with this exact structure:
+{ "predictions": [ { "question_text": string, "probability": number (0-100), "explanation": string, "historical_years": number[], "similar_questions": string[] } ] }
+
+Rules:
+- Return 5-8 predictions minimum
+- Higher probability = more likely to appear
+- Base probability on how frequently topic appeared across years
+- Explanation must mention specific years
 
 Previous Questions:
 ${questionsList || 'None uploaded yet'}
 
-Study Resources:
+Study Resources (summary):
 ${resourcesText || 'None'}` },
   ]);
 
@@ -239,15 +289,15 @@ ${resourcesText || 'None'}` },
   `;
 
   sendSSE(jobId, { type: 'complete', predictions: result.predictions });
-  void sendLog(`✅ Job #${jobId} complete\n📘 ${subject} ${targetYear}\n🔮 ${result.predictions.length} predictions generated`, 'success');
-  cancelledJobs.delete(jobId);
+  void sendLog(`✅ Job #${jobId} complete\n📘 ${subject} ${targetYear}\n🔮 ${result.predictions.length} predictions`, 'success');
+  cleanupJob(jobId);
 }
 
 function estimateETA(stage, current, total) {
   const remaining = total - current;
-  if (stage === 'ocr') return remaining * 3;
-  if (stage === 'ocr_resources') return remaining * 5;
-  if (stage === 'ai') return 15;
+  if (stage === 'ocr') return remaining * 4;
+  if (stage === 'ocr_resources') return remaining * 15;
+  if (stage === 'ai') return 20;
   return null;
 }
 

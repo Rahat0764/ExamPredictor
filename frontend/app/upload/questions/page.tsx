@@ -1,7 +1,9 @@
 "use client"
-import { useState, useRef } from "react"
+import { useState, useRef, useEffect } from "react"
 import Link from "next/link"
 import { toast } from "sonner"
+import { useRouter } from "next/navigation"
+import { getToken, authHeaders } from "@/lib/auth"
 
 const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL || ""
 
@@ -14,6 +16,7 @@ const currentYear = new Date().getFullYear()
 const years = Array.from({ length: currentYear - 1989 }, (_, i) => currentYear - i)
 
 export default function UploadQuestions() {
+  const router = useRouter()
   const [subject, setSubject] = useState("")
   const [selectedYear, setSelectedYear] = useState(currentYear)
   const [batches, setBatches] = useState<BatchItem[]>([])
@@ -23,6 +26,14 @@ export default function UploadQuestions() {
   const [uploadedResults, setUploadedResults] = useState<{ year: number; files: string[] }[]>([])
   const [error, setError] = useState("")
   const inputRef = useRef<HTMLInputElement>(null)
+
+  // Auth Guard: Not logged in? Go to login page
+  useEffect(() => {
+    const token = getToken()
+    if (!token) {
+      router.push("/login")
+    }
+  }, [router])
 
   const totalFiles = batches.reduce((acc, b) => acc + b.files.length, 0)
 
@@ -61,7 +72,11 @@ export default function UploadQuestions() {
         formData.append("subject", subject.trim())
         batch.files.forEach(f => formData.append("files", f))
 
-        const res = await fetch(`${BACKEND}/api/upload/questions`, { method: "POST", body: formData })
+        const res = await fetch(`${BACKEND}/api/upload/questions`, { 
+          method: "POST", 
+          headers: authHeaders(), // Added headers for authentication
+          body: formData 
+        })
         const data = await res.json()
         if (data.error) throw new Error(`Year ${batch.year}: ${data.error}`)
 

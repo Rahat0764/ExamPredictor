@@ -1,7 +1,9 @@
 "use client"
-import { useState, useRef } from "react"
+import { useState, useRef, useEffect } from "react"
 import Link from "next/link"
 import { toast } from "sonner"
+import { useRouter } from "next/navigation"
+import { getToken, authHeaders } from "@/lib/auth"
 
 const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL || ""
 
@@ -11,6 +13,7 @@ interface ResourceItem {
 }
 
 export default function UploadResources() {
+  const router = useRouter()
   const [subject, setSubject] = useState("")
   const [resourceName, setResourceName] = useState("")
   const [queue, setQueue] = useState<ResourceItem[]>([])
@@ -20,6 +23,14 @@ export default function UploadResources() {
   const [uploadedResults, setUploadedResults] = useState<{ name: string; files: string[] }[]>([])
   const [error, setError] = useState("")
   const inputRef = useRef<HTMLInputElement>(null)
+
+  // Auth Guard: Not logged in? Go to login page
+  useEffect(() => {
+    const token = getToken()
+    if (!token) {
+      router.push("/login")
+    }
+  }, [router])
 
   const totalFiles = queue.reduce((acc, q) => acc + q.files.length, 0)
 
@@ -54,7 +65,11 @@ export default function UploadResources() {
         formData.append("name", item.name)
         item.files.forEach(f => formData.append("files", f))
 
-        const res = await fetch(`${BACKEND}/api/upload/resources`, { method: "POST", body: formData })
+        const res = await fetch(`${BACKEND}/api/upload/resources`, { 
+          method: "POST", 
+          headers: authHeaders(), // Added headers for authentication
+          body: formData 
+        })
         const data = await res.json()
         if (data.error) throw new Error(`"${item.name}": ${data.error}`)
 

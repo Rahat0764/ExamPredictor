@@ -49,10 +49,11 @@ export async function fetchMe(): Promise<User | null> {
   } catch { return null }
 }
 
-export function authHeaders() {
+export function authHeaders(): Record<string, string> {
   const token = getToken()
   return token ? { Authorization: `Bearer ${token}` } : {}
 }
+
 
 export function loginWithGoogle() {
   window.location.href = `${BACKEND}/auth/google`

@@ -4,16 +4,28 @@ const { v4: uuidv4 } = require('uuid');
 const { sql } = require('../db');
 const { uploadFileToDrive } = require('../services/drive');
 const { sendLog } = require('../services/telegram');
+const { optionalAuth, requireAuth } = require('../middleware/auth');
 const router = express.Router();
 
-// Store in memory (stream to Drive)
+const ALLOWED_MIMES = [
+  'image/jpeg', 'image/jpg', 'image/png', 'image/webp',
+  'application/pdf',
+];
+
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 600 * 1024 * 1024 }, // 600MB
+  limits: { fileSize: 600 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (ALLOWED_MIMES.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error(`File type not allowed: ${file.mimetype}`));
+    }
+  },
 });
 
-// POST /api/upload/questions
-router.post('/questions', upload.array('files', 20), async (req, res) => {
+// POST /api/upload/questions — requires auth
+router.post('/questions', requireAuth, upload.array('files', 20), async (req, res) => {
   try {
     const { year, subject } = req.body;
     const files = req.files;
@@ -31,16 +43,17 @@ router.post('/questions', upload.array('files', 20), async (req, res) => {
 
     for (const file of files) {
       const fileName = `${uuidv4()}-${file.originalname}`;
-      const driveResult = await uploadFileToDrive(file.buffer, fileName, file.mimetype);
+      // Store in upload/question/ subfolder
+      const driveResult = await uploadFileToDrive(file.buffer, fileName, file.mimetype, 'upload/question');
 
       await sql`
         INSERT INTO questions (subject_id, year, text, image_url, drive_file_id, mime_type)
-        VALUES (${subjectId}, ${parseInt(year)}, '', ${driveResult.viewUrl}, ${driveResult.fileId}, ${file.mimetype})
+        VALUES (${subjectId}, ${parseInt(year)}, '', ${driveResult.cdnUrl}, ${driveResult.fileId}, ${file.mimetype})
       `;
-      results.push({ url: driveResult.viewUrl, name: file.originalname });
+      results.push({ url: driveResult.cdnUrl, name: file.originalname });
     }
 
-    void sendLog(`📝 Questions uploaded\nSubject: ${subject}\nYear: ${year}\nFiles: ${files.length}`, 'success');
+    void sendLog(`📝 Questions uploaded\nUser: ${req.user.email}\nSubject: ${subject}\nYear: ${year}\nFiles: ${files.length}`, 'success');
     res.json({ success: true, results });
   } catch (err) {
     void sendLog(`📝 Question upload failed\nError: ${err.message}`, 'error');
@@ -48,8 +61,8 @@ router.post('/questions', upload.array('files', 20), async (req, res) => {
   }
 });
 
-// POST /api/upload/resources
-router.post('/resources', upload.array('files', 20), async (req, res) => {
+// POST /api/upload/resources — requires auth
+router.post('/resources', requireAuth, upload.array('files', 20), async (req, res) => {
   try {
     const { subject, name } = req.body;
     const files = req.files;
@@ -60,22 +73,34 @@ router.post('/resources', upload.array('files', 20), async (req, res) => {
     const results = [];
     for (const file of files) {
       const fileName = `${uuidv4()}-${file.originalname}`;
-      const driveResult = await uploadFileToDrive(file.buffer, fileName, file.mimetype);
+      // Store in upload/resource/ subfolder
+      const driveResult = await uploadFileToDrive(file.buffer, fileName, file.mimetype, 'upload/resource');
       const isPdf = file.mimetype.includes('pdf') || file.originalname.endsWith('.pdf');
 
       await sql`
         INSERT INTO resources (subject_name, name, text, file_url, drive_file_id, mime_type, type)
-        VALUES (${subject || null}, ${name}, '', ${driveResult.viewUrl}, ${driveResult.fileId}, ${file.mimetype}, ${isPdf ? 'pdf' : 'image'})
+        VALUES (${subject || null}, ${name}, '', ${driveResult.cdnUrl}, ${driveResult.fileId}, ${file.mimetype}, ${isPdf ? 'pdf' : 'image'})
       `;
-      results.push({ url: driveResult.viewUrl, name: file.originalname });
+      results.push({ url: driveResult.cdnUrl, name: file.originalname });
     }
 
-    void sendLog(`📚 Resources uploaded\nSubject: ${subject || 'N/A'}\nName: ${name}\nFiles: ${files.length}`, 'success');
+    void sendLog(`📚 Resources uploaded\nUser: ${req.user.email}\nSubject: ${subject || 'N/A'}\nName: ${name}\nFiles: ${files.length}`, 'success');
     res.json({ success: true, results });
   } catch (err) {
     void sendLog(`📚 Resource upload failed\nError: ${err.message}`, 'error');
     res.status(500).json({ error: err.message });
   }
+});
+
+// Multer error handler
+router.use((err, req, res, next) => {
+  if (err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(400).json({ error: 'File too large. Max 600MB.' });
+  }
+  if (err.message?.startsWith('File type not allowed')) {
+    return res.status(400).json({ error: err.message });
+  }
+  next(err);
 });
 
 module.exports = router;

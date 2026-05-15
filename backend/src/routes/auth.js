@@ -3,64 +3,132 @@ const { google } = require('googleapis');
 const axios = require('axios');
 const bcrypt = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
+const multer = require('multer');
 const { sql } = require('../db');
 const { generateToken } = require('../middleware/auth');
 const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/email');
+const { uploadFileToDrive } = require('../services/drive');
 
 const router = express.Router();
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
 
+// Avatar upload multer — memory, 5MB max, images only
+const avatarUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (['image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/gif'].includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files allowed for avatar'));
+    }
+  },
+});
+
+// =================== TEMP MAIL BLOCK ===================
+// Known disposable/temp mail domains
+const BLOCKED_DOMAINS = new Set([
+  'mailinator.com', 'guerrillamail.com', 'tempmail.com', 'throwaway.email',
+  'yopmail.com', 'sharklasers.com', 'guerrillamailblock.com', 'grr.la',
+  'guerrillamail.info', 'guerrillamail.biz', 'guerrillamail.de', 'guerrillamail.net',
+  'guerrillamail.org', 'spam4.me', 'trashmail.com', 'trashmail.me', 'trashmail.at',
+  'trashmail.io', 'trashmail.net', 'dispostable.com', 'mailnull.com', 'spamgourmet.com',
+  'spamgourmet.net', 'spamgourmet.org', 'spamgourmet.com', 'fakeinbox.com', 'maildrop.cc',
+  'spamfree24.org', 'discard.email', 'mailsac.com', 'mailbucket.org', 'mailscrap.com',
+  'tempr.email', 'tempinbox.com', 'tempemail.net', 'emailondeck.com', 'tempemails.net',
+  'throwam.com', 'temp-mail.org', 'temp-mail.ru', 'email-fake.com', 'fakemail.net',
+  'getairmail.com', 'inboxbear.com', 'inboxkitten.com', 'moakt.com', 'mt2015.com',
+  'spambox.us', 'spambox.info', 'spambox.org', 'spambox.me', 'mailnew.com',
+  'mytemp.email', 'nwytg.net', 'owlpic.com', 'pfui.ru', 'sendspamhere.com',
+  'sharedmailbox.org', 'throam.com', 'throwam.com', 'tmailinator.com',
+  'trash-mail.at', 'trashmail.at', 'trashmail.me', 'trashmail.net', 'trashmail.xyz',
+  'trbvm.com', 'uggsrock.com', 'zero.zeromail.org', 'zippymail.info', 'r4nd0m.de',
+  'fastacura.com', 'fast-email.com', 'fast-mail.org', 'easymail.top', 'getmails.eu',
+]);
+
+function isBlockedEmail(email) {
+  const domain = email.split('@')[1]?.toLowerCase();
+  if (!domain) return true;
+  if (BLOCKED_DOMAINS.has(domain)) return true;
+  // Also block common temp mail patterns
+  if (domain.includes('temp') && !['temple.edu', 'templar.com'].includes(domain)) return true;
+  if (domain.includes('trash') && !['trashbin.com'].includes(domain)) return true;
+  if (domain.includes('fake') && !['fake.org'].includes(domain)) return true;
+  if (domain.includes('spam') && !['spam.org'].includes(domain)) return true;
+  return false;
+}
+
+// Trusted TLDs and domains — basic check
+const TRUSTED_DOMAINS = new Set([
+  'gmail.com', 'yahoo.com', 'yahoo.co.uk', 'yahoo.fr', 'yahoo.de', 'yahoo.es', 'yahoo.it', 'yahoo.ca',
+  'hotmail.com', 'hotmail.co.uk', 'hotmail.fr', 'hotmail.de', 'outlook.com', 'outlook.co.uk',
+  'live.com', 'msn.com', 'icloud.com', 'me.com', 'mac.com', 'protonmail.com', 'proton.me',
+  'tutanota.com', 'tutamail.com', 'fastmail.com', 'fastmail.fm', 'zoho.com', 'aol.com',
+  'rediffmail.com', 'yandex.com', 'yandex.ru', 'mail.ru', 'rambler.ru',
+  // Bangladesh common
+  'anorr.com', 'grameenphone.com', 'robi.com.bd', 'banglalink.net',
+  // Educational
+  'edu', // TLD
+  // Company emails (allow by TLD)
+]);
+
+// Allow educational (.edu, .ac) and company emails, only block known disposable
+function isEmailAllowed(email) {
+  const lower = email.toLowerCase();
+  const domain = lower.split('@')[1];
+  if (!domain) return false;
+
+  if (isBlockedEmail(lower)) return false;
+
+  // Allow everything except known blocked domains
+  // This is more permissive — blocks temp mail but allows company emails
+  return true;
+}
+
 // =================== GOOGLE OAUTH ===================
 
 router.get('/google', (req, res) => {
-  const mode = req.query.mode || 'login'; // 'login' or 'drive'
   const oauth2Client = new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
     process.env.GOOGLE_CLIENT_SECRET,
     `${process.env.BACKEND_URL}/auth/callback/google`
   );
+  const url = oauth2Client.generateAuthFormat({
+    access_type: 'offline',
+    scope: ['profile', 'email'],
+    prompt: 'consent',
+  });
+  res.redirect(url);
+});
 
-  const scopes = mode === 'drive'
-    ? ['https://www.googleapis.com/auth/drive.file', 'profile', 'email']
-    : ['profile', 'email'];
-
+// Fix: use generateAuthUrl not generateAuthFormat
+router.get('/google', (req, res) => {
+  const oauth2Client = new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    `${process.env.BACKEND_URL}/auth/callback/google`
+  );
   const url = oauth2Client.generateAuthUrl({
     access_type: 'offline',
-    scope: scopes,
+    scope: ['profile', 'email'],
     prompt: 'consent',
-    state: mode,
   });
   res.redirect(url);
 });
 
 router.get('/callback/google', async (req, res) => {
-  const { code, state } = req.query;
+  const { code } = req.query;
   const oauth2Client = new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
     process.env.GOOGLE_CLIENT_SECRET,
     `${process.env.BACKEND_URL}/auth/callback/google`
   );
-
   try {
     const { tokens } = await oauth2Client.getToken(code);
-
-    // If drive setup mode, save refresh token and redirect
-    if (state === 'drive') {
-      console.log('GOOGLE_REFRESH_TOKEN =', tokens.refresh_token);
-      return res.send(`
-        <h2>✅ Drive Connected!</h2>
-        <p>Refresh Token:</p>
-        <code style="word-break:break-all">${tokens.refresh_token}</code>
-        <p>Add to Render as GOOGLE_REFRESH_TOKEN</p>
-      `);
-    }
-
-    // User login mode — get profile
     oauth2Client.setCredentials(tokens);
     const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client });
     const { data: profile } = await oauth2.userinfo.get();
 
-    // Upsert user
     const existing = await sql`SELECT * FROM users WHERE email = ${profile.email}`;
     let user;
     if (existing.length) {
@@ -97,7 +165,6 @@ router.get('/github', (req, res) => {
 router.get('/callback/github', async (req, res) => {
   const { code } = req.query;
   try {
-    // Get access token
     const tokenRes = await axios.post('https://github.com/login/oauth/access_token', {
       client_id: process.env.GITHUB_CLIENT_ID,
       client_secret: process.env.GITHUB_CLIENT_SECRET,
@@ -105,18 +172,15 @@ router.get('/callback/github', async (req, res) => {
     }, { headers: { Accept: 'application/json' } });
     const accessToken = tokenRes.data.access_token;
 
-    // Get profile
     const profileRes = await axios.get('https://api.github.com/user', {
       headers: { Authorization: `Bearer ${accessToken}` }
     });
     const profile = profileRes.data;
 
-    // Get emails
     const emailsRes = await axios.get('https://api.github.com/user/emails', {
       headers: { Authorization: `Bearer ${accessToken}` }
     });
     const primaryEmail = emailsRes.data.find(e => e.primary)?.email || profile.email;
-
     if (!primaryEmail) throw new Error('No email from GitHub');
 
     const existing = await sql`SELECT * FROM users WHERE email = ${primaryEmail}`;
@@ -151,6 +215,12 @@ router.post('/register', async (req, res) => {
   const { email, password, name } = req.body;
   if (!email || !password || !name) return res.status(400).json({ error: 'All fields required' });
   if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  if (name.trim().length < 2) return res.status(400).json({ error: 'Name too short' });
+
+  // Email validation
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(email)) return res.status(400).json({ error: 'Invalid email format' });
+  if (!isEmailAllowed(email)) return res.status(400).json({ error: 'Disposable/temporary email addresses are not allowed. Please use a real email.' });
 
   try {
     const existing = await sql`SELECT id FROM users WHERE email = ${email.toLowerCase()}`;
@@ -160,10 +230,9 @@ router.post('/register', async (req, res) => {
     const token = uuidv4();
     const expires = new Date(Date.now() + 24 * 60 * 60 * 1000);
 
-    const user = await sql`
+    await sql`
       INSERT INTO users (email, name, password_hash, provider, verification_token, verification_expires)
       VALUES (${email.toLowerCase()}, ${name.trim()}, ${hash}, 'email', ${token}, ${expires})
-      RETURNING id, email, name
     `;
 
     await sendVerificationEmail(email.toLowerCase(), name.trim(), token);
@@ -197,16 +266,9 @@ router.post('/login', async (req, res) => {
 router.get('/verify-email', async (req, res) => {
   const { token } = req.query;
   try {
-    const users = await sql`
-      SELECT * FROM users WHERE verification_token = ${token} AND verification_expires > NOW()
-    `;
-    if (!users.length) {
-      return res.redirect(`${FRONTEND_URL}/login?error=invalid_token`);
-    }
-    await sql`
-      UPDATE users SET email_verified=true, verification_token=NULL, verification_expires=NULL
-      WHERE id=${users[0].id}
-    `;
+    const users = await sql`SELECT * FROM users WHERE verification_token = ${token} AND verification_expires > NOW()`;
+    if (!users.length) return res.redirect(`${FRONTEND_URL}/login?error=invalid_token`);
+    await sql`UPDATE users SET email_verified=true, verification_token=NULL, verification_expires=NULL WHERE id=${users[0].id}`;
     const jwtToken = generateToken(users[0].id);
     return res.redirect(`${FRONTEND_URL}/auth/callback?token=${jwtToken}&name=${encodeURIComponent(users[0].name || '')}&email=${encodeURIComponent(users[0].email)}&avatar=`);
   } catch (e) {
@@ -233,7 +295,7 @@ router.post('/forgot-password', async (req, res) => {
   const { email } = req.body;
   try {
     const users = await sql`SELECT * FROM users WHERE email = ${email.toLowerCase()} AND provider = 'email'`;
-    if (!users.length) return res.json({ ok: true }); // Don't reveal
+    if (!users.length) return res.json({ ok: true });
     const token = uuidv4();
     const expires = new Date(Date.now() + 60 * 60 * 1000);
     await sql`UPDATE users SET reset_token=${token}, reset_expires=${expires} WHERE id=${users[0].id}`;
@@ -259,19 +321,48 @@ router.post('/reset-password', async (req, res) => {
 });
 
 // =================== PROFILE ===================
-
 const { requireAuth } = require('../middleware/auth');
 
 router.get('/me', requireAuth, (req, res) => {
   res.json({ user: req.user });
 });
 
+// Upload avatar to Drive user/profile/ folder
+router.post('/profile/avatar', requireAuth, avatarUpload.single('avatar'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No image provided' });
+
+    const ext = req.file.originalname.split('.').pop() || 'jpg';
+    const fileName = `user-${req.user.id}-avatar-${Date.now()}.${ext}`;
+
+    const driveResult = await uploadFileToDrive(
+      req.file.buffer,
+      fileName,
+      req.file.mimetype,
+      'user/profile'
+    );
+
+    // Update user avatar_url
+    const updated = await sql`
+      UPDATE users SET avatar_url=${driveResult.cdnUrl}, updated_at=NOW()
+      WHERE id=${req.user.id}
+      RETURNING id, email, name, avatar_url, provider, email_verified
+    `;
+
+    res.json({ user: updated[0], avatarUrl: driveResult.cdnUrl });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 router.patch('/profile', requireAuth, async (req, res) => {
-  const { name, avatar_url } = req.body;
+  const { name } = req.body;
+  if (!name || name.trim().length < 2) return res.status(400).json({ error: 'Name too short' });
   try {
     const updated = await sql`
-      UPDATE users SET name=${name || req.user.name}, avatar_url=${avatar_url || req.user.avatar_url}, updated_at=NOW()
-      WHERE id=${req.user.id} RETURNING id, email, name, avatar_url, provider, email_verified
+      UPDATE users SET name=${name.trim()}, updated_at=NOW()
+      WHERE id=${req.user.id}
+      RETURNING id, email, name, avatar_url, provider, email_verified
     `;
     res.json({ user: updated[0] });
   } catch (e) {
@@ -279,9 +370,35 @@ router.patch('/profile', requireAuth, async (req, res) => {
   }
 });
 
-// Old drive setup route (keep for compatibility)
+// Drive setup — keep for admin use
 router.get('/google/drive-setup', (req, res) => {
-  res.redirect('/auth/google?mode=drive');
+  const oauth2Client = new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    `${process.env.BACKEND_URL}/auth/callback/google-drive`
+  );
+  const url = oauth2Client.generateAuthUrl({
+    access_type: 'offline',
+    scope: ['https://www.googleapis.com/auth/drive.file'],
+    prompt: 'consent',
+  });
+  res.redirect(url);
+});
+
+router.get('/callback/google-drive', async (req, res) => {
+  const { code } = req.query;
+  const oauth2Client = new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    `${process.env.BACKEND_URL}/auth/callback/google-drive`
+  );
+  try {
+    const { tokens } = await oauth2Client.getToken(code);
+    console.log('GOOGLE_REFRESH_TOKEN =', tokens.refresh_token);
+    res.send(`<h2>✅ Drive Token</h2><code>${tokens.refresh_token}</code><p>Add to Render as GOOGLE_REFRESH_TOKEN</p>`);
+  } catch (e) {
+    res.send(`Error: ${e.message}`);
+  }
 });
 
 module.exports = router;

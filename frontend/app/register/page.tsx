@@ -1,21 +1,83 @@
 "use client"
-import { useState } from "react"
+import { useState, useCallback } from "react"
 import Link from "next/link"
 import { toast } from "sonner"
 import { loginWithGoogle, loginWithGithub } from "@/lib/auth"
 
 const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL || ""
 
+function PasswordStrength({ password }: { password: string }) {
+  const getStrength = () => {
+    if (!password) return { score: 0, label: "", color: "" }
+    let score = 0
+    if (password.length >= 8) score++
+    if (password.length >= 12) score++
+    if (/[A-Z]/.test(password)) score++
+    if (/[0-9]/.test(password)) score++
+    if (/[^A-Za-z0-9]/.test(password)) score++
+
+    if (score <= 1) return { score: 1, label: "Weak", color: "#f43f5e" }
+    if (score <= 2) return { score: 2, label: "Fair", color: "#f59e0b" }
+    if (score <= 3) return { score: 3, label: "Good", color: "#3b82f6" }
+    if (score <= 4) return { score: 4, label: "Strong", color: "#10b981" }
+    return { score: 5, label: "Very Strong", color: "#10b981" }
+  }
+
+  const { score, label, color } = getStrength()
+  if (!password) return null
+
+  const requirements = [
+    { met: password.length >= 8, text: "8+ characters (required)" },
+    { met: /[A-Z]/.test(password), text: "1 uppercase letter" },
+    { met: /[a-z]{2,}/.test(password), text: "2+ lowercase letters" },
+    { met: /[0-9]/.test(password), text: "1 number" },
+    { met: /[^A-Za-z0-9]/.test(password), text: "1 special character" },
+  ]
+
+  return (
+    <div style={{ marginTop: 8 }}>
+      {/* Strength bars */}
+      <div className="flex gap-1 mb-1">
+        {[1, 2, 3, 4, 5].map(i => (
+          <div key={i} style={{
+            flex: 1, height: 3, borderRadius: 3,
+            background: i <= score ? color : "rgba(255,255,255,0.1)",
+            transition: "background 0.3s",
+          }} />
+        ))}
+      </div>
+      <div style={{ fontSize: 11, color, marginBottom: 8, fontWeight: 600 }}>{label}</div>
+
+      {/* Requirements */}
+      <div className="flex flex-col gap-1">
+        {requirements.map((req, i) => (
+          <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: req.met ? "#10b981" : "var(--text-muted)" }}>
+            <span>{req.met ? "✓" : "○"}</span>
+            <span style={{ textDecoration: req.met ? "line-through" : "none", opacity: req.met ? 0.7 : 1 }}>{req.text}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 export default function RegisterPage() {
   const [name, setName] = useState("")
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")
+  const [confirmPassword, setConfirmPassword] = useState("")
+  const [showPassword, setShowPassword] = useState(false)
+  const [showConfirm, setShowConfirm] = useState(false)
   const [loading, setLoading] = useState(false)
   const [done, setDone] = useState(false)
 
+  const passwordMatch = confirmPassword.length > 0 && password === confirmPassword
+  const passwordMismatch = confirmPassword.length > 0 && password !== confirmPassword
+
   const handleRegister = async () => {
-    if (!name || !email || !password) return
+    if (!name || !email || !password || !confirmPassword) { toast.error("All fields required"); return }
     if (password.length < 8) { toast.error("Password must be at least 8 characters"); return }
+    if (password !== confirmPassword) { toast.error("Passwords don't match"); return }
     setLoading(true)
     try {
       const res = await fetch(`${BACKEND}/auth/register`, {
@@ -33,30 +95,42 @@ export default function RegisterPage() {
     }
   }
 
+  const EyeIcon = ({ show }: { show: boolean }) => (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      {show ? (
+        <>
+          <path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19m-6.72-1.07a3 3 0 11-4.24-4.24"/>
+          <line x1="1" y1="1" x2="23" y2="23"/>
+        </>
+      ) : (
+        <>
+          <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+          <circle cx="12" cy="12" r="3"/>
+        </>
+      )}
+    </svg>
+  )
+
   if (done) {
     return (
-      <div className="min-h-screen flex items-center justify-center px-4">
+      <div className="min-h-[80vh] flex items-center justify-center px-4">
         <div className="glass-card text-center" style={{ maxWidth: 420, padding: 40 }}>
           <div style={{ fontSize: 56, marginBottom: 16 }}>✉️</div>
           <h2 style={{ fontSize: 22, fontWeight: 700, marginBottom: 8, color: "var(--text-primary)" }}>Check your email!</h2>
           <p style={{ color: "var(--text-muted)", fontSize: 14, lineHeight: 1.6, marginBottom: 24 }}>
             We sent a verification link to <strong style={{ color: "var(--violet-light)" }}>{email}</strong>. Click it to activate your account.
           </p>
-          <Link href="/login" className="btn-primary-glow px-8 py-3 text-sm no-underline">
-            Back to Login
-          </Link>
+          <Link href="/login" className="btn-primary-glow px-8 py-3 text-sm no-underline">Back to Login</Link>
         </div>
       </div>
     )
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center px-4">
-      <div style={{ width: "100%", maxWidth: 420 }}>
+    <div className="min-h-[80vh] flex items-center justify-center px-4 py-8">
+      <div style={{ width: "100%", maxWidth: 440 }}>
         <div className="text-center mb-8">
-          <Link href="/" className="gradient-text text-[28px] font-extrabold tracking-[-0.5px] no-underline">
-            ExamPredictor
-          </Link>
+          <Link href="/" className="gradient-text text-[28px] font-extrabold tracking-[-0.5px] no-underline">ExamPredictor</Link>
           <p style={{ color: "var(--text-muted)", fontSize: 14, marginTop: 8 }}>Create your free account</p>
         </div>
 
@@ -81,7 +155,7 @@ export default function RegisterPage() {
 
           <div className="flex items-center gap-3 mb-5">
             <div style={{ flex: 1, height: 1, background: "var(--border-color)" }} />
-            <span style={{ fontSize: 12, color: "var(--text-muted)" }}>or</span>
+            <span style={{ fontSize: 12, color: "var(--text-muted)" }}>or email</span>
             <div style={{ flex: 1, height: 1, background: "var(--border-color)" }} />
           </div>
 
@@ -90,16 +164,70 @@ export default function RegisterPage() {
               <label style={{ fontSize: 11, fontWeight: 600, letterSpacing: 1, textTransform: "uppercase", color: "var(--text-muted)" }}>Full Name</label>
               <input type="text" value={name} onChange={e => setName(e.target.value)} placeholder="Your name" className="form-input-styled" />
             </div>
+
             <div className="flex flex-col gap-1.5">
               <label style={{ fontSize: 11, fontWeight: 600, letterSpacing: 1, textTransform: "uppercase", color: "var(--text-muted)" }}>Email</label>
               <input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@example.com" className="form-input-styled" />
             </div>
+
             <div className="flex flex-col gap-1.5">
               <label style={{ fontSize: 11, fontWeight: 600, letterSpacing: 1, textTransform: "uppercase", color: "var(--text-muted)" }}>Password</label>
-              <input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="Min 8 characters" className="form-input-styled" onKeyDown={e => e.key === "Enter" && handleRegister()} />
+              <div style={{ position: "relative" }}>
+                <input
+                  type={showPassword ? "text" : "password"}
+                  value={password}
+                  onChange={e => setPassword(e.target.value)}
+                  placeholder="Min 8 characters"
+                  className="form-input-styled"
+                  style={{ paddingRight: 44 }}
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword(!showPassword)}
+                  style={{ position: "absolute", right: 12, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", cursor: "pointer", color: "var(--text-muted)", display: "flex" }}
+                >
+                  <EyeIcon show={showPassword} />
+                </button>
+              </div>
+              {password && <PasswordStrength password={password} />}
             </div>
 
-            <button onClick={handleRegister} disabled={loading || !name || !email || !password} className="btn-primary-glow w-full py-3 text-sm">
+            <div className="flex flex-col gap-1.5">
+              <label style={{ fontSize: 11, fontWeight: 600, letterSpacing: 1, textTransform: "uppercase", color: "var(--text-muted)" }}>Confirm Password</label>
+              <div style={{ position: "relative" }}>
+                <input
+                  type={showConfirm ? "text" : "password"}
+                  value={confirmPassword}
+                  onChange={e => setConfirmPassword(e.target.value)}
+                  placeholder="Repeat your password"
+                  className="form-input-styled"
+                  style={{
+                    paddingRight: 44,
+                    borderColor: passwordMatch ? "#10b981" : passwordMismatch ? "#f43f5e" : undefined,
+                    boxShadow: passwordMatch ? "0 0 0 3px rgba(16,185,129,0.15)" : passwordMismatch ? "0 0 0 3px rgba(244,63,94,0.15)" : undefined,
+                  }}
+                  onKeyDown={e => e.key === "Enter" && handleRegister()}
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowConfirm(!showConfirm)}
+                  style={{ position: "absolute", right: 12, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", cursor: "pointer", color: "var(--text-muted)", display: "flex" }}
+                >
+                  <EyeIcon show={showConfirm} />
+                </button>
+              </div>
+              {confirmPassword.length > 0 && (
+                <div style={{ fontSize: 11, fontWeight: 600, color: passwordMatch ? "#10b981" : "#f43f5e", display: "flex", alignItems: "center", gap: 4 }}>
+                  {passwordMatch ? "✓ Passwords match" : "✗ Passwords don't match"}
+                </div>
+              )}
+            </div>
+
+            <button
+              onClick={handleRegister}
+              disabled={loading || !name || !email || !password || !confirmPassword || passwordMismatch}
+              className="btn-primary-glow w-full py-3 text-sm"
+            >
               {loading ? <><span className="inline-block animate-spin">⟳</span> Creating account...</> : "Create Account"}
             </button>
           </div>
